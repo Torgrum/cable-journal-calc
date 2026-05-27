@@ -1,25 +1,50 @@
+import re
 import streamlit as st
 import pandas as pd
 import io
 import json
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.cell.cell import MergedCell
 
 st.set_page_config(page_title="Универсальный КЖ", page_icon="📋", layout="wide")
 st.title("📋 Универсальный калькулятор кабельного журнала")
 
 
-# --- Инициализация состояния ---
+# --- Инициализация ---
 if "template" not in st.session_state:
     st.session_state.template = None
 if "config" not in st.session_state:
     st.session_state.config = None
-# df хранится ВНУТРИ data_editor через key="editor"
 
 
-def get_merged_cell_value(ws, row, col):
-    """Возвращает значение объединённой ячейки (из верхнего-левого угла)."""
+# --- Парсер диапазона Excel: "B5:J6" → (start_row, start_col, end_row, end_col) ---
+def parse_range(range_str):
+    """Парсит диапазон вида 'B5:J6' или 'B5' (одна ячейка)."""
+    s = range_str.strip().upper().replace(" ", "")
+    if not s:
+        raise ValueError("Диапазон пустой")
+    
+    if ":" not in s:
+        s = f"{s}:{s}"
+    
+    m = re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", s)
+    if not m:
+        raise ValueError("Формат должен быть как 'B5:J6' (буквы-цифры:буквы-цифры)")
+    
+    col1 = column_index_from_string(m.group(1))
+    row1 = int(m.group(2))
+    col2 = column_index_from_string(m.group(3))
+    row2 = int(m.group(4))
+    
+    if row1 > row2: row1, row2 = row2, row1
+    if col1 > col2: col1, col2 = col2, col1
+    
+    return row1, col1, row2, col2
+
+
+def get_merged_value(ws, row, col):
+    """Возвращает значение ячейки, учитывая merged cells."""
     cell = ws.cell(row=row, column=col)
     if isinstance(cell, MergedCell):
         for rng in ws.merged_cells.ranges:
@@ -28,66 +53,46 @@ def get_merged_cell_value(ws, row, col):
     return cell.value
 
 
-def find_header_row(ws, max_search=20):
-    """Ищет первую строку с ≥3 подряд заполненными ячейками."""
-    for row in range(1, max_search + 1):
-        filled = 0
-        for col in range(1, ws.max_column + 1):
-            val = get_merged_cell_value(ws, row, col)
-            if val not in (None, ""):
-                filled += 1
-            else:
-                filled = 0
-            if filled >= 3:
-                return row
-    return 1
-
-
-def parse_template(file_bytes, sheet_name=None, header_row=None, header_rows=1):
-    """
-    Разбирает шаблон Excel.
-    header_rows — сколько строк занимает заголовок (1, 2, 3...).
-    """
+def parse_template(file_bytes, sheet_name, header_range_str):
+    """Разбирает шаблон по явно указанному диапазону заголовка."""
     wb = load_workbook(io.BytesIO(file_bytes))
-    ws = wb[sheet_name] if sheet_name else wb.active
-
-    if header_row is None:
-        header_row = find_header_row(ws)
-
-    # Читаем заголовки из нескольких строк
-    columns = {}  # {итоговое_имя: номер_колонки}
-    max_col = ws.max_column
-
-    for col in range(1, max_col + 1):
+    ws = wb[sheet_name]
+    
+    row1, col1, row2, col2 = parse_range(header_range_str)
+    
+    # Формируем имена колонок: объединяем значения из всех строк диапазона через " / "
+    columns = {}  # {имя: номер_колонки}
+    for col in range(col1, col2 + 1):
         parts = []
-        for r in range(header_row, header_row + header_rows):
-            val = get_merged_cell_value(ws, r, col)
+        for r in range(row1, row2 + 1):
+            val = get_merged_value(ws, r, col)
             if val not in (None, ""):
                 parts.append(str(val).strip().replace("\n", " "))
         if parts:
-            # Уникальное имя: объединяем через " / "
             name = " / ".join(parts)
-            # Делаем имя уникальным, если дублируется
+            # Уникальность имён
             base, counter = name, 1
             while name in columns:
                 name = f"{base} ({counter})"
                 counter += 1
             columns[name] = col
-
-    # Определяем типы по первой строке данных
-    data_start_row = header_row + header_rows
+    
+    if not columns:
+        raise ValueError(f"В диапазоне '{header_range_str}' не найдено ни одного заголовка")
+    
+    # Типы — по первой строке данных (row2 + 1)
+    data_start_row = row2 + 1
     types = {}
     for col_name, col_idx in columns.items():
-        sample = get_merged_cell_value(ws, data_start_row, col_idx)
+        sample = get_merged_value(ws, data_start_row, col_idx)
         if isinstance(sample, (int, float)) and not isinstance(sample, bool):
             types[col_name] = "number"
         else:
             types[col_name] = "text"
-
+    
     return {
         "ws_name": ws.title,
-        "header_row": header_row,
-        "header_rows": header_rows,
+        "header_range": f"{get_column_letter(col1)}{row1}:{get_column_letter(col2)}{row2}",
         "data_start_row": data_start_row,
         "columns": columns,
         "types": types,
@@ -103,74 +108,75 @@ with st.sidebar:
     if uploaded is not None:
         st.session_state.template = uploaded.getvalue()
 
+        # Список листов
         wb_tmp = load_workbook(io.BytesIO(uploaded.getvalue()), read_only=True)
         sheet_names = wb_tmp.sheetnames
         wb_tmp.close()
 
         selected_sheet = st.selectbox("Лист", sheet_names)
 
-        # 🔧 АВТООПРЕДЕЛЕНИЕ строки заголовков
-        wb_preview = load_workbook(io.BytesIO(uploaded.getvalue()), read_only=True)
-        ws_preview = wb_preview[selected_sheet]
-        auto_row = find_header_row(ws_preview)
-        wb_preview.close()
-
-        header_row = st.number_input(
-            "Строка начала заголовков",
-            min_value=1, max_value=50, value=auto_row,
-            help="Первая строка, где начинаются заголовки"
+        # 🔧 ЯВНЫЙ ВВОД ДИАПАЗОНА
+        st.markdown("**Диапазон ячеек заголовка**")
+        header_range = st.text_input(
+            "Диапазон (как в Excel)",
+            value="A1:E1",
+            placeholder="Например: B5:J6",
+            help="Укажите диапазон, где находятся заголовки столбцов. "
+                 "Примеры: 'A6:E6' (одна строка), 'B5:J6' (две строки), 'C3:H4' (объединённые)."
         )
-        header_rows = st.number_input(
-            "Сколько строк занимает заголовок",
-            min_value=1, max_value=10, value=1,
-            help="Если заголовок в 2-3 строки (например: 'Трасса' сверху, 'Начало/Конец' снизу) — укажите 2 или 3"
-        )
+        
+        # Быстрые примеры
+        st.caption("Примеры: `A6:E6`, `B5:J6`, `C3:H4`")
 
         if st.button("🔄 Применить и распознать", type="primary"):
             try:
                 cfg = parse_template(
                     st.session_state.template,
                     sheet_name=selected_sheet,
-                    header_row=int(header_row),
-                    header_rows=int(header_rows),
+                    header_range_str=header_range,
                 )
                 st.session_state.config = cfg
-                # 🔧 Правильная инициализация editor state
-                if "editor_init" not in st.session_state:
-                    st.session_state.editor_init = []
-                st.success(f"✅ Найдено {len(cfg['columns'])} столбцов. Данные начнутся со строки {cfg['data_start_row']}.")
+                # Инициализация состояния редактора
+                if "editor" not in st.session_state:
+                    st.session_state.editor = []
                 st.rerun()
+            except ValueError as e:
+                st.error(f"❌ {e}")
             except Exception as e:
-                st.error(f"Ошибка разбора: {e}")
+                st.error(f"Ошибка: {e}")
 
     st.divider()
-    st.caption("💡 Формулы, рамки, стили шаблона сохранятся")
+    st.caption("💡 Формулы, рамки и стили шаблона сохраняются")
+    st.caption("💡 Данные записываются со строки, следующей после заголовка")
 
 
 # --- Основная область ---
 if st.session_state.config:
     cfg = st.session_state.config
 
-    with st.expander("📐 Структура шаблона", expanded=False):
-        st.write(f"**Лист:** `{cfg['ws_name']}`")
-        st.write(f"**Заголовок:** строки {cfg['header_row']}–{cfg['header_row'] + cfg['header_rows'] - 1}")
-        st.write(f"**Данные начнутся со строки:** {cfg['data_start_row']}")
-        st.write(f"**Столбцов:** {len(cfg['columns'])}")
-
+    # Информация о структуре
+    with st.expander("📐 Распознанная структура", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        c1.write(f"**Лист:** `{cfg['ws_name']}`")
+        c2.write(f"**Заголовок:** `{cfg['header_range']}`")
+        c3.write(f"**Данные начнутся со строки:** {cfg['data_start_row']}")
+        
+        st.markdown(f"**Столбцов найдено: {len(cfg['columns'])}**")
+        
         cols_preview = pd.DataFrame([
             {
+                "№": i + 1,
                 "Имя в приложении": name,
                 "Колонка Excel": get_column_letter(idx),
                 "Тип": "🔢 число" if cfg["types"][name] == "number" else "🔤 текст",
             }
-            for name, idx in cfg["columns"].items()
+            for i, (name, idx) in enumerate(cfg["columns"].items())
         ])
         st.dataframe(cols_preview, use_container_width=True, hide_index=True)
 
     # --- Редактор таблицы ---
     st.subheader("📝 Заполнение данных")
 
-    # Динамическая конфигурация
     column_config = {}
     for col_name in cfg["columns"].keys():
         if cfg["types"].get(col_name) == "number":
@@ -178,10 +184,9 @@ if st.session_state.config:
         else:
             column_config[col_name] = st.column_config.TextColumn(col_name)
 
-    # 🔧 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: используем key="editor"
-    # Данные теперь хранятся в st.session_state["editor"] автоматически
+    # 🔧 key="editor" — данные живут в st.session_state["editor"] автоматически
     st.data_editor(
-        st.session_state.get("editor_init", []),
+        [],  # начальное состояние — пустой список, всё остальное в session_state
         column_config=column_config,
         column_order=list(cfg["columns"].keys()),
         hide_index=True,
@@ -190,28 +195,31 @@ if st.session_state.config:
         key="editor",
     )
 
-    # Забираем данные из editor state
-    editor_state = st.session_state.get("editor", {"added_rows": [], "edited_rows": {}, "deleted_rows": []})
+    # Забираем актуальные данные из состояния редактора
+    editor_state = st.session_state.get("editor", [])
+    if isinstance(editor_state, dict):
+        # Старый формат с added_rows — совместимость
+        df_rows = editor_state.get("added_rows", [])
+    else:
+        df_rows = editor_state if editor_state else []
     
-    # Формируем DataFrame из состояния редактора
-    df_rows = []
-    if editor_state.get("added_rows"):
-        df_rows.extend(editor_state["added_rows"])
-    
-    # Применяем правки существующих строк
-    if hasattr(st.session_state, "_last_rows"):
-        for i, row in enumerate(st.session_state._last_rows):
-            if i in editor_state.get("edited_rows", {}):
-                row.update(editor_state["edited_rows"][i])
-            df_rows.append(row)
+    # Фильтруем пустые строки (которые пользователь мог добавить случайно)
+    df_rows = [
+        row for row in df_rows
+        if any(v not in (None, "", 0, 0.0) and not (isinstance(v, float) and pd.isna(v))
+               for v in row.values())
+    ]
 
-    # --- Сводка ---
+    # Сводка
     if df_rows:
         st.subheader("📊 Сводка")
         c1, c2 = st.columns(2)
         c1.metric("Строк заполнено", len(df_rows))
-        # Сохраняем для последующих операций
-        st.session_state._last_rows = df_rows
+        df_tmp = pd.DataFrame(df_rows)
+        numeric_cols = [c for c in df_tmp.columns if df_tmp[c].dtype in ['float64', 'int64']]
+        if numeric_cols:
+            total = df_tmp[numeric_cols].sum().sum()
+            c2.metric("Сумма по числам", f"{total:.2f}")
 
     st.divider()
 
@@ -224,8 +232,23 @@ if st.session_state.config:
                 ws = wb[cfg["ws_name"]]
 
                 data_start = cfg["data_start_row"]
-                col_map = cfg["columns"]  # {имя: номер_колонки}
+                col_map = cfg["columns"]
 
+                # Опционально: очищаем старые данные ниже заголовка (по колонкам шаблона)
+                # чтобы не было "хвостов" от предыдущих заполнений
+                for row_idx in range(data_start, data_start + 500):  # запас
+                    all_empty = True
+                    for col_idx in col_map.values():
+                        cell = ws.cell(row=row_idx, column=col_idx)
+                        if isinstance(cell.value, str) and cell.value.startswith("="):
+                            all_empty = False  # формула — не трогаем
+                            continue
+                        cell.value = None
+                    if all_empty:
+                        # Если строка полностью пустая (кроме формул) — можно остановиться
+                        pass
+
+                # Записываем новые данные
                 for i, row_data in enumerate(df_rows):
                     excel_row = data_start + i
                     for col_name, value in row_data.items():
@@ -234,7 +257,7 @@ if st.session_state.config:
                         excel_col = col_map[col_name]
                         cell = ws.cell(row=excel_row, column=excel_col)
 
-                        # НЕ перезаписываем формулы шаблона
+                        # Не перезаписываем формулы шаблона
                         if isinstance(cell.value, str) and cell.value.startswith("="):
                             continue
 
@@ -253,11 +276,12 @@ if st.session_state.config:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
-                st.success("✅ Готово! Форматирование и формулы шаблона сохранены.")
+                st.success(f"✅ Готово! Записано {len(df_rows)} строк со строки {data_start}.")
             except Exception as e:
                 st.error(f"Ошибка экспорта: {e}")
+                st.exception(e)
 
-        # Сохранение проекта в JSON
+        # Сохранение проекта
         json_str = json.dumps(df_rows, ensure_ascii=False, default=str)
         st.download_button(
             "💾 Сохранить проект (.json)",
@@ -269,28 +293,41 @@ if st.session_state.config:
         st.info("Добавьте строки в таблицу — появится кнопка экспорта")
 
 else:
-    st.info("👈 Загрузите шаблон `.xlsx` слева и нажмите **«Применить и распознать»**")
+    st.info("👈 Загрузите шаблон `.xlsx` слева и укажите диапазон заголовков")
 
     st.markdown("""
-    ### 📋 Многострочные заголовки
+    ### 🎯 Как указать диапазон
     
-    Приложение умеет работать с заголовками в 2–3 строки. Примеры:
+    Откройте ваш файл в Excel и посмотрите координаты ячеек заголовка (в левом верхнем углу Excel).
     
-    **Пример 1: объединённые ячейки**
-    | | A | B | C |
-    |---|---|---|---|
-    | Строка 5 | **Трасса** (merged B5:C5) | | |
-    | Строка 6 | | Начало | Конец |
-    | Строка 7 | | 1 | 2 ← данные |
+    | Структура шаблона | Что указать |
+    |-------------------|-------------|
+    | Заголовки в **одну строку**, например A6:E6 | `A6:E6` |
+    | Заголовки в **две строки** (например, «Трасса» сверху, «Начало/Конец» снизу) | `B5:C6` |
+    | Заголовки в **три строки** | `B4:D6` |
+    | Заголовки **только по центру листа** | `C3:H3` |
     
-    → Укажите: строка начала = **5**, строк заголовка = **2**
+    ### 📐 Пример для типичного КЖ
+    
+    ```
+    Строка 1: [логотип]
+    Строка 2: Проект: ...
+    Строка 3-5: (пусто)
+    Строка 6: № | Марка | Откуда | Куда | Длина   ← заголовки
+    Строка 7: 1 | ...   | ...    | ...  | 15.5    ← данные
+    ```
+    
+    → Диапазон: **`A6:E6`**
+    → Данные будут записаны со строки **7**
+    
+    ### 🧩 Многострочные заголовки
+    
+    ```
+    Строка 5: [объединённая ячейка]  Трасса
+    Строка 6:                        Начало | Конец
+    Строка 7:                        1      | 2     ← данные
+    ```
+    
+    → Диапазон: **`B5:C6`**
     → Получите столбцы: `Трасса / Начало`, `Трасса / Конец`
-    
-    **Пример 2: перенос текста**
-    | Строка 4 | № | **Длина кабеля, м** | Примечание |
-    | Строка 5 | | (с запасом 15%) | |
-    | Строка 6 | 1 | 15.5 | — ← данные |
-    
-    → Укажите: строка = **4**, строк = **2**
-    → Получите: `Длина кабеля, м / (с запасом 15%)`
     """)
