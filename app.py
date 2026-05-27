@@ -42,15 +42,10 @@ def get_merged_value(ws, row, col):
 
 
 def get_merged_ranges_in_range(ws, r1, c1, r2, c2):
-    """Возвращает список объединённых диапазонов, пересекающихся с указанным диапазоном.
-    Каждый элемент: (start_row, start_col, end_row, end_col, value, rowspan, colspan)
-    """
     result = []
     for rng in ws.merged_cells.ranges:
-        # Пересекается ли объединение с нашим диапазоном?
         if (rng.min_row <= r2 and rng.max_row >= r1 and
             rng.min_col <= c2 and rng.max_col >= c1):
-            # Берём только ту часть, что внутри нашего диапазона
             local_r1 = max(rng.min_row, r1)
             local_c1 = max(rng.min_col, c1)
             local_r2 = min(rng.max_row, r2)
@@ -67,11 +62,8 @@ def get_merged_ranges_in_range(ws, r1, c1, r2, c2):
 
 
 def build_header_html(r1, c1, r2, c2, merged_ranges):
-    """Строит HTML-таблицу, визуализирующую заголовок с объединениями."""
     nrows = r2 - r1 + 1
     ncols = c2 - c1 + 1
-    
-    # Матрица: какая ячейка уже занята объединением
     covered = [[False] * ncols for _ in range(nrows)]
     
     html = '<table style="border-collapse: collapse; margin: 10px 0; font-family: monospace;">'
@@ -83,7 +75,6 @@ def build_header_html(r1, c1, r2, c2, merged_ranges):
             abs_r = r1 + ri
             abs_c = c1 + ci
             
-            # Ищем объединение, покрывающее эту ячейку
             found = None
             for mr in merged_ranges:
                 if mr["r1"] == abs_r and mr["c1"] == abs_c:
@@ -91,7 +82,6 @@ def build_header_html(r1, c1, r2, c2, merged_ranges):
                     break
             
             if found:
-                # Отмечаем покрытые ячейки
                 for dr in range(found["rowspan"]):
                     for dc in range(found["colspan"]):
                         if ri + dr < nrows and ci + dc < ncols:
@@ -102,7 +92,6 @@ def build_header_html(r1, c1, r2, c2, merged_ranges):
                          f'background: #e7f3ff; font-weight: bold; text-align: center; '
                          f'vertical-align: middle; min-width: 60px;">{val}</td>')
             else:
-                # Обычная ячейка
                 html += (f'<td style="border: 1px solid #888; padding: 6px 10px; '
                          f'text-align: center; min-width: 60px;"></td>')
         html += "</tr>"
@@ -115,35 +104,49 @@ def parse_template(file_bytes, sheet_name, header_range_str):
     ws = wb[sheet_name]
     r1, c1, r2, c2 = parse_range(header_range_str)
 
-    # Собираем объединения в диапазоне заголовка
     merged_ranges = get_merged_ranges_in_range(ws, r1, c1, r2, c2)
 
-    # Для каждой ячейки — находим "главное" объединение (с минимальной координатой)
-    # Это нужно, чтобы объединённые ячейки получали одно имя на все свои колонки
+    # 🔗 НОВОЕ: собираем информацию об объединениях для каждой колонки
+    # col_merge_info[col_idx] = {"group_name": "...", "is_merged": True/False, "merge_span": 2}
+    col_merge_info = {}
+    for mr in merged_ranges:
+        if mr["rowspan"] == 1 and mr["colspan"] > 1:
+            # Горизонтальное объединение в одной строке
+            group_name = str(mr["value"]) if mr["value"] else ""
+            for c in range(mr["c1"], mr["c2"] + 1):
+                col_merge_info[c] = {
+                    "group_name": group_name,
+                    "is_merged": True,
+                    "merge_span": mr["colspan"],
+                    "merge_start": c == mr["c1"],  # первая колонка в группе
+                }
+        elif mr["colspan"] == 1 and mr["rowspan"] > 1:
+            # Вертикальное объединение — одна колонка
+            col_merge_info[mr["c1"]] = {
+                "group_name": str(mr["value"]) if mr["value"] else "",
+                "is_merged": True,
+                "merge_span": 1,
+                "merge_start": True,
+            }
+
     def get_top_left_for_cell(row, col):
-        """Возвращает (top_row, left_col) объединения, покрывающего ячейку."""
         for mr in merged_ranges:
             if mr["r1"] <= row <= mr["r2"] and mr["c1"] <= col <= mr["c2"]:
                 return (mr["r1"], mr["c1"])
         return (row, col)
 
-    # Собираем имена колонок
     columns = {}
     for col in range(c1, c2 + 1):
-        # Группируем ячейки по объединению
         parts_by_group = {}
         for r in range(r1, r2 + 1):
             tl = get_top_left_for_cell(r, col)
             val = get_merged_value(ws, r, col)
             if val not in (None, ""):
                 key = str(val).strip().replace("\n", " ")
-                # Добавляем в группу (топ-левая ячейка)
                 parts_by_group.setdefault(tl, []).append(key)
         
-        # Убираем дубликаты (одна и та же объединённая ячейка не должна повторяться)
         seen = []
         for tl in sorted(parts_by_group.keys()):
-            # Берём только первое значение из группы (оно уже уникально)
             if parts_by_group[tl]:
                 v = parts_by_group[tl][0]
                 if v not in seen:
@@ -151,15 +154,20 @@ def parse_template(file_bytes, sheet_name, header_range_str):
         
         if seen:
             name = " / ".join(seen)
-            # Уникальность
             base, counter = name, 1
             final_name = name
             while final_name in columns:
-                # Добавляем индекс колонки в Excel, чтобы различать
                 final_name = f"{base} [{get_column_letter(col)}]"
                 counter += 1
                 if counter > 10:
                     break
+            
+            # 🔗 НОВОЕ: добавляем маркер объединения в имя
+            if col in col_merge_info and col_merge_info[col]["is_merged"]:
+                info = col_merge_info[col]
+                if info["merge_start"]:
+                    final_name = f"🔗 {final_name}"
+            
             columns[final_name] = col
 
     if not columns:
@@ -171,7 +179,6 @@ def parse_template(file_bytes, sheet_name, header_range_str):
         sample = get_merged_value(ws, data_start_row, idx)
         types[name] = "number" if isinstance(sample, (int, float)) and not isinstance(sample, bool) else "text"
 
-    # HTML-превью заголовка
     header_html = build_header_html(r1, c1, r2, c2, merged_ranges)
 
     return {
@@ -181,6 +188,7 @@ def parse_template(file_bytes, sheet_name, header_range_str):
         "columns": columns,
         "types": types,
         "merged_ranges": merged_ranges,
+        "col_merge_info": col_merge_info,
         "header_html": header_html,
         "header_coords": (r1, c1, r2, c2),
     }
@@ -237,18 +245,17 @@ if st.session_state.config:
     if st.session_state.df_data is None or list(st.session_state.df_data.columns) != cols:
         st.session_state.df_data = pd.DataFrame(columns=cols)
 
-    with st.expander("📐 Структура шаблона (с объединениями)", expanded=True):
+    with st.expander("📐 Структура шаблона (с объединениями)", expanded=False):
         c1, c2, c3 = st.columns(3)
         c1.write(f"**Лист:** `{cfg['ws_name']}`")
         c2.write(f"**Диапазон:** `{cfg['header_range']}`")
         c3.write(f"**Старт данных:** строка {cfg['data_start_row']}")
         
-        st.markdown("**📋 Визуализация заголовка (как в Excel):**")
+        st.markdown("**📋 Визуализация заголовка:**")
         st.markdown(cfg["header_html"], unsafe_allow_html=True)
         
         if cfg["merged_ranges"]:
-            st.info(f"🔗 Найдено **{len(cfg['merged_ranges'])} объединённых диапазонов** в заголовке. "
-                    f"Они сохранятся при экспорте в Excel.")
+            st.info(f"🔗 Найдено **{len(cfg['merged_ranges'])} объединённых диапазонов**.")
         
         st.markdown("**Сопоставление столбцов:**")
         st.dataframe(pd.DataFrame([
@@ -256,13 +263,31 @@ if st.session_state.config:
                 "Имя в калькуляторе": n,
                 "Excel": get_column_letter(i),
                 "Тип": "🔢 число" if cfg["types"][n] == "number" else "🔤 текст",
+                "Объединено": "✅ Да" if n.startswith("🔗") else "—",
             }
             for n, i in cfg["columns"].items()
         ]), hide_index=True, use_container_width=True)
 
     st.subheader("📝 Заполнение данных")
-    st.caption("⚠️ В редакторе объединения не отображаются (ограничение веб-таблиц), "
-               "но в экспортированном Excel они будут на месте.")
+    
+    # 🔗 НОВОЕ: Легенда объединений над редактором
+    merged_cols = [n for n in cols if n.startswith("🔗")]
+    if merged_cols:
+        with st.expander("🔗 Карта объединённых колонок", expanded=True):
+            st.caption("Колонки с эмодзи 🔗 объединены в шаблоне. Они сгруппированы вместе для удобства.")
+            
+            # Группируем по именам (убираем 🔗 и берём первую часть до " / ")
+            groups = {}
+            for col_name in merged_cols:
+                clean_name = col_name.replace("🔗 ", "")
+                group_key = clean_name.split(" / ")[0] if " / " in clean_name else clean_name
+                groups.setdefault(group_key, []).append(col_name)
+            
+            for group_name, group_cols in groups.items():
+                if len(group_cols) > 1:
+                    st.markdown(f"**{group_name}** объединяет: {', '.join([f'`{c}`' for c in group_cols])}")
+    
+    st.caption("💡 **Совет:** Объединённые колонки помечены 🔗 и идут рядом друг с другом.")
 
     col_cfg = {}
     for n in cols:
@@ -300,7 +325,12 @@ if st.session_state.config:
                 wb = load_workbook(io.BytesIO(st.session_state.template))
                 ws = wb[cfg["ws_name"]]
                 start_row = cfg["data_start_row"]
-                col_map = cfg["columns"]
+                
+                # 🔗 Убираем эмодзи 🔗 из имён колонок для маппинга
+                col_map = {}
+                for name, idx in cfg["columns"].items():
+                    clean_name = name.replace("🔗 ", "")
+                    col_map[clean_name] = idx
 
                 # Очистка старых данных
                 for r in range(start_row, start_row + 1000):
@@ -319,8 +349,10 @@ if st.session_state.config:
                 # Запись новых
                 for i, (_, row) in enumerate(df_clean.iterrows()):
                     for col_name, val in row.items():
-                        if col_name in col_map:
-                            cell = ws.cell(row=start_row + i, column=col_map[col_name])
+                        # Убираем 🔗 из имени
+                        clean_col = col_name.replace("🔗 ", "")
+                        if clean_col in col_map:
+                            cell = ws.cell(row=start_row + i, column=col_map[clean_col])
                             if not (isinstance(cell.value, str) and cell.value.startswith("=")):
                                 cell.value = None if pd.isna(val) else val
 
@@ -328,7 +360,7 @@ if st.session_state.config:
                 st.download_button("⬇️ Скачать", output.getvalue(), "journal_filled.xlsx",
                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    use_container_width=True)
-                st.success(f"✅ Записано {len(df_clean)} строк. Объединения и стили шаблона сохранены.")
+                st.success(f"✅ Записано {len(df_clean)} строк. Объединения сохранены.")
             except Exception as e:
                 st.error(f"Ошибка: {e}")
 
@@ -342,12 +374,9 @@ else:
     st.markdown("""
     ### 🔗 Объединённые ячейки
     
-    Приложение **автоматически распознаёт** объединения в заголовке:
-    
-    | Пример шаблона | Как будет показано |
-    |----------------|-------------------|
-    | `Трасса` (merged на 2 колонки) сверху<br>`Начало` / `Конец` снизу | HTML-превью с объединённой ячейкой |
-    | Имена столбцов в редакторе: `Трасса / Начало`, `Трасса / Конец` | |
-    
-    ✅ При экспорте в Excel все объединения **сохраняются**.
+    Приложение автоматически:
+    - ✅ Распознаёт объединения в заголовке
+    - ✅ Показывает их в превью (голубые ячейки)
+    - ✅ Маркирует в редакторе эмодзи 🔗
+    - ✅ Сохраняет при экспорте в Excel
     """)
