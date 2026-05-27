@@ -10,41 +10,27 @@ from openpyxl.cell.cell import MergedCell
 st.set_page_config(page_title="Универсальный КЖ", page_icon="📋", layout="wide")
 st.title("📋 Универсальный калькулятор кабельного журнала")
 
-
-# --- Инициализация ---
+# --- Инициализация состояния ---
+# Данные таблицы храним отдельно от виджета
+if "df_data" not in st.session_state:
+    st.session_state.df_data = None
 if "template" not in st.session_state:
     st.session_state.template = None
 if "config" not in st.session_state:
     st.session_state.config = None
 
 
-# --- Парсер диапазона Excel: "B5:J6" → (start_row, start_col, end_row, end_col) ---
 def parse_range(range_str):
-    """Парсит диапазон вида 'B5:J6' или 'B5' (одна ячейка)."""
     s = range_str.strip().upper().replace(" ", "")
-    if not s:
-        raise ValueError("Диапазон пустой")
-    
-    if ":" not in s:
-        s = f"{s}:{s}"
-    
+    if not s: raise ValueError("Диапазон пустой")
+    if ":" not in s: s = f"{s}:{s}"
     m = re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", s)
-    if not m:
-        raise ValueError("Формат должен быть как 'B5:J6' (буквы-цифры:буквы-цифры)")
-    
-    col1 = column_index_from_string(m.group(1))
-    row1 = int(m.group(2))
-    col2 = column_index_from_string(m.group(3))
-    row2 = int(m.group(4))
-    
-    if row1 > row2: row1, row2 = row2, row1
-    if col1 > col2: col1, col2 = col2, col1
-    
-    return row1, col1, row2, col2
+    if not m: raise ValueError("Формат: 'B5:J6'")
+    c1, r1, c2, r2 = column_index_from_string(m.group(1)), int(m.group(2)), column_index_from_string(m.group(3)), int(m.group(4))
+    return (min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2))
 
 
 def get_merged_value(ws, row, col):
-    """Возвращает значение ячейки, учитывая merged cells."""
     cell = ws.cell(row=row, column=col)
     if isinstance(cell, MergedCell):
         for rng in ws.merged_cells.ranges:
@@ -54,280 +40,153 @@ def get_merged_value(ws, row, col):
 
 
 def parse_template(file_bytes, sheet_name, header_range_str):
-    """Разбирает шаблон по явно указанному диапазону заголовка."""
     wb = load_workbook(io.BytesIO(file_bytes))
     ws = wb[sheet_name]
+    r1, c1, r2, c2 = parse_range(header_range_str)
     
-    row1, col1, row2, col2 = parse_range(header_range_str)
-    
-    # Формируем имена колонок: объединяем значения из всех строк диапазона через " / "
-    columns = {}  # {имя: номер_колонки}
-    for col in range(col1, col2 + 1):
-        parts = []
-        for r in range(row1, row2 + 1):
-            val = get_merged_value(ws, r, col)
-            if val not in (None, ""):
-                parts.append(str(val).strip().replace("\n", " "))
+    columns = {}
+    for col in range(c1, c2 + 1):
+        parts = [str(get_merged_value(ws, r, col)).strip().replace("\n", " ") 
+                 for r in range(r1, r2 + 1) if get_merged_value(ws, r, col) not in (None, "")]
         if parts:
             name = " / ".join(parts)
-            # Уникальность имён
             base, counter = name, 1
             while name in columns:
                 name = f"{base} ({counter})"
                 counter += 1
             columns[name] = col
+            
+    if not columns: raise ValueError(f"В диапазоне '{header_range_str}' нет заголовков")
     
-    if not columns:
-        raise ValueError(f"В диапазоне '{header_range_str}' не найдено ни одного заголовка")
-    
-    # Типы — по первой строке данных (row2 + 1)
-    data_start_row = row2 + 1
+    data_start_row = r2 + 1
     types = {}
-    for col_name, col_idx in columns.items():
-        sample = get_merged_value(ws, data_start_row, col_idx)
-        if isinstance(sample, (int, float)) and not isinstance(sample, bool):
-            types[col_name] = "number"
-        else:
-            types[col_name] = "text"
-    
+    for name, idx in columns.items():
+        sample = get_merged_value(ws, data_start_row, idx)
+        types[name] = "number" if isinstance(sample, (int, float)) and not isinstance(sample, bool) else "text"
+        
     return {
-        "ws_name": ws.title,
-        "header_range": f"{get_column_letter(col1)}{row1}:{get_column_letter(col2)}{row2}",
-        "data_start_row": data_start_row,
-        "columns": columns,
-        "types": types,
+        "ws_name": ws.title, "header_range": f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}",
+        "data_start_row": data_start_row, "columns": columns, "types": types,
     }
 
 
 # --- Боковая панель ---
 with st.sidebar:
     st.header("⚙️ Настройки")
-
     uploaded = st.file_uploader("📄 Загрузить шаблон .xlsx", type=["xlsx"])
 
-    if uploaded is not None:
+    if uploaded:
         st.session_state.template = uploaded.getvalue()
-
-        # Список листов
         wb_tmp = load_workbook(io.BytesIO(uploaded.getvalue()), read_only=True)
-        sheet_names = wb_tmp.sheetnames
+        selected_sheet = st.selectbox("Лист", wb_tmp.sheetnames)
         wb_tmp.close()
 
-        selected_sheet = st.selectbox("Лист", sheet_names)
+        st.markdown("**Диапазон заголовка** (напр. `B5:J6`)")
+        header_range = st.text_input("Диапазон", value="A1:E1", placeholder="B5:J6")
 
-        # 🔧 ЯВНЫЙ ВВОД ДИАПАЗОНА
-        st.markdown("**Диапазон ячеек заголовка**")
-        header_range = st.text_input(
-            "Диапазон (как в Excel)",
-            value="A1:E1",
-            placeholder="Например: B5:J6",
-            help="Укажите диапазон, где находятся заголовки столбцов. "
-                 "Примеры: 'A6:E6' (одна строка), 'B5:J6' (две строки), 'C3:H4' (объединённые)."
-        )
-        
-        # Быстрые примеры
-        st.caption("Примеры: `A6:E6`, `B5:J6`, `C3:H4`")
-
-        if st.button("🔄 Применить и распознать", type="primary"):
+        if st.button("🔄 Применить", type="primary"):
             try:
-                cfg = parse_template(
-                    st.session_state.template,
-                    sheet_name=selected_sheet,
-                    header_range_str=header_range,
-                )
+                cfg = parse_template(st.session_state.template, selected_sheet, header_range)
                 st.session_state.config = cfg
-                # Инициализация состояния редактора
-                if "editor" not in st.session_state:
-                    st.session_state.editor = []
+                # 🔑 СБРОС ДАННЫХ при смене шаблона
+                st.session_state.df_data = pd.DataFrame(columns=list(cfg["columns"].keys()))
                 st.rerun()
-            except ValueError as e:
-                st.error(f"❌ {e}")
             except Exception as e:
                 st.error(f"Ошибка: {e}")
-
-    st.divider()
-    st.caption("💡 Формулы, рамки и стили шаблона сохраняются")
-    st.caption("💡 Данные записываются со строки, следующей после заголовка")
-
 
 # --- Основная область ---
 if st.session_state.config:
     cfg = st.session_state.config
+    cols = list(cfg["columns"].keys())
+    
+    # Защита от рассинхрона колонок
+    if st.session_state.df_data is None or list(st.session_state.df_data.columns) != cols:
+        st.session_state.df_data = pd.DataFrame(columns=cols)
 
-    # Информация о структуре
-    with st.expander("📐 Распознанная структура", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        c1.write(f"**Лист:** `{cfg['ws_name']}`")
-        c2.write(f"**Заголовок:** `{cfg['header_range']}`")
-        c3.write(f"**Данные начнутся со строки:** {cfg['data_start_row']}")
-        
-        st.markdown(f"**Столбцов найдено: {len(cfg['columns'])}**")
-        
-        cols_preview = pd.DataFrame([
-            {
-                "№": i + 1,
-                "Имя в приложении": name,
-                "Колонка Excel": get_column_letter(idx),
-                "Тип": "🔢 число" if cfg["types"][name] == "number" else "🔤 текст",
-            }
-            for i, (name, idx) in enumerate(cfg["columns"].items())
-        ])
-        st.dataframe(cols_preview, use_container_width=True, hide_index=True)
+    with st.expander("📐 Структура", expanded=False):
+        st.write(f"**Лист:** `{cfg['ws_name']}` | **Заголовок:** `{cfg['header_range']}` | **Старт данных:** строка {cfg['data_start_row']}")
+        st.dataframe(pd.DataFrame([
+            {"Имя": n, "Excel": get_column_letter(i), "Тип": "🔢" if cfg["types"][n]=="number" else "🔤"}
+            for n, i in cfg["columns"].items()
+        ]), hide_index=True, use_container_width=True)
 
-    # --- Редактор таблицы ---
-    st.subheader("📝 Заполнение данных")
-
-    column_config = {}
-    for col_name in cfg["columns"].keys():
-        if cfg["types"].get(col_name) == "number":
-            column_config[col_name] = st.column_config.NumberColumn(col_name, step=0.5)
+    st.subheader("📝 Заполнение")
+    
+    # Конфигурация колонок
+    col_cfg = {}
+    for n in cols:
+        if cfg["types"][n] == "number":
+            col_cfg[n] = st.column_config.NumberColumn(n, step=0.5)
         else:
-            column_config[col_name] = st.column_config.TextColumn(col_name)
+            col_cfg[n] = st.column_config.TextColumn(n)
 
-    # 🔧 key="editor" — данные живут в st.session_state["editor"] автоматически
-    st.data_editor(
-        [],  # начальное состояние — пустой список, всё остальное в session_state
-        column_config=column_config,
-        column_order=list(cfg["columns"].keys()),
+    # 🔑 ГЛАВНОЕ ИСПРАВЛЕНИЕ:
+    # 1. НЕ используем key="editor" для хранения данных
+    # 2. Передаем текущий DF из session_state
+    # 3. Результат сразу сохраняем обратно
+    edited_df = st.data_editor(
+        st.session_state.df_data,
+        column_config=col_cfg,
+        column_order=cols,
         hide_index=True,
         use_container_width=True,
         num_rows="dynamic",
-        key="editor",
     )
+    st.session_state.df_data = edited_df
 
-    # Забираем актуальные данные из состояния редактора
-    editor_state = st.session_state.get("editor", [])
-    if isinstance(editor_state, dict):
-        # Старый формат с added_rows — совместимость
-        df_rows = editor_state.get("added_rows", [])
-    else:
-        df_rows = editor_state if editor_state else []
+    # Очистка пустых строк для подсчета и экспорта
+    df_clean = edited_df.replace('', pd.NA).dropna(how='all')
     
-    # Фильтруем пустые строки (которые пользователь мог добавить случайно)
-    df_rows = [
-        row for row in df_rows
-        if any(v not in (None, "", 0, 0.0) and not (isinstance(v, float) and pd.isna(v))
-               for v in row.values())
-    ]
-
-    # Сводка
-    if df_rows:
+    if not df_clean.empty:
         st.subheader("📊 Сводка")
         c1, c2 = st.columns(2)
-        c1.metric("Строк заполнено", len(df_rows))
-        df_tmp = pd.DataFrame(df_rows)
-        numeric_cols = [c for c in df_tmp.columns if df_tmp[c].dtype in ['float64', 'int64']]
-        if numeric_cols:
-            total = df_tmp[numeric_cols].sum().sum()
-            c2.metric("Сумма по числам", f"{total:.2f}")
+        c1.metric("Строк", len(df_clean))
+        num_cols = df_clean.select_dtypes(include=['number']).columns
+        if len(num_cols) > 0:
+            c2.metric("Сумма", f"{df_clean[num_cols].sum().sum():.2f}")
 
-    st.divider()
-
-    # --- Экспорт ---
-    if df_rows:
-        if st.button("📥 Сформировать Excel по шаблону", type="primary"):
+        st.divider()
+        
+        if st.button("📥 Сформировать Excel", type="primary"):
             try:
                 output = io.BytesIO()
                 wb = load_workbook(io.BytesIO(st.session_state.template))
                 ws = wb[cfg["ws_name"]]
-
-                data_start = cfg["data_start_row"]
+                start_row = cfg["data_start_row"]
                 col_map = cfg["columns"]
 
-                # Опционально: очищаем старые данные ниже заголовка (по колонкам шаблона)
-                # чтобы не было "хвостов" от предыдущих заполнений
-                for row_idx in range(data_start, data_start + 500):  # запас
-                    all_empty = True
-                    for col_idx in col_map.values():
-                        cell = ws.cell(row=row_idx, column=col_idx)
-                        if isinstance(cell.value, str) and cell.value.startswith("="):
-                            all_empty = False  # формула — не трогаем
-                            continue
-                        cell.value = None
-                    if all_empty:
-                        # Если строка полностью пустая (кроме формул) — можно остановиться
-                        pass
-
-                # Записываем новые данные
-                for i, row_data in enumerate(df_rows):
-                    excel_row = data_start + i
-                    for col_name, value in row_data.items():
-                        if col_name not in col_map:
-                            continue
-                        excel_col = col_map[col_name]
-                        cell = ws.cell(row=excel_row, column=excel_col)
-
-                        # Не перезаписываем формулы шаблона
-                        if isinstance(cell.value, str) and cell.value.startswith("="):
-                            continue
-
-                        # Пустые значения
-                        if value in (None, "") or (isinstance(value, float) and pd.isna(value)):
+                # Очистка старых данных (опционально, чтобы не было хвостов)
+                for r in range(start_row, start_row + 1000):
+                    if all(ws.cell(row=r, column=c).value in (None, "") or 
+                           (isinstance(ws.cell(row=r, column=c).value, str) and ws.cell(row=r, column=c).value.startswith("="))
+                           for c in col_map.values()):
+                        break
+                    for c in col_map.values():
+                        cell = ws.cell(row=r, column=c)
+                        if not (isinstance(cell.value, str) and cell.value.startswith("=")):
                             cell.value = None
-                        else:
-                            cell.value = value
+
+                # Запись новых
+                for i, (_, row) in enumerate(df_clean.iterrows()):
+                    for col_name, val in row.items():
+                        if col_name in col_map:
+                            cell = ws.cell(row=start_row + i, column=col_map[col_name])
+                            if not (isinstance(cell.value, str) and cell.value.startswith("=")):
+                                cell.value = None if pd.isna(val) else val
 
                 wb.save(output)
-
-                st.download_button(
-                    label="⬇️ Скачать заполненный файл",
-                    data=output.getvalue(),
-                    file_name="кабельный_журнал_заполненный.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-                st.success(f"✅ Готово! Записано {len(df_rows)} строк со строки {data_start}.")
+                st.download_button("⬇️ Скачать", output.getvalue(), "journal_filled.xlsx", 
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
+                st.success(f"✅ Записано {len(df_clean)} строк.")
             except Exception as e:
-                st.error(f"Ошибка экспорта: {e}")
-                st.exception(e)
-
-        # Сохранение проекта
-        json_str = json.dumps(df_rows, ensure_ascii=False, default=str)
-        st.download_button(
-            "💾 Сохранить проект (.json)",
-            data=json_str.encode("utf-8"),
-            file_name="project.json",
-            mime="application/json",
-        )
+                st.error(f"Ошибка: {e}")
+                
+        # JSON экспорт
+        st.download_button("💾 JSON", df_clean.to_json(orient="records", force_ascii=False).encode("utf-8"), 
+                           "project.json", "application/json")
     else:
-        st.info("Добавьте строки в таблицу — появится кнопка экспорта")
+        st.info("Добавьте строки в таблицу.")
 
 else:
-    st.info("👈 Загрузите шаблон `.xlsx` слева и укажите диапазон заголовков")
-
-    st.markdown("""
-    ### 🎯 Как указать диапазон
-    
-    Откройте ваш файл в Excel и посмотрите координаты ячеек заголовка (в левом верхнем углу Excel).
-    
-    | Структура шаблона | Что указать |
-    |-------------------|-------------|
-    | Заголовки в **одну строку**, например A6:E6 | `A6:E6` |
-    | Заголовки в **две строки** (например, «Трасса» сверху, «Начало/Конец» снизу) | `B5:C6` |
-    | Заголовки в **три строки** | `B4:D6` |
-    | Заголовки **только по центру листа** | `C3:H3` |
-    
-    ### 📐 Пример для типичного КЖ
-    
-    ```
-    Строка 1: [логотип]
-    Строка 2: Проект: ...
-    Строка 3-5: (пусто)
-    Строка 6: № | Марка | Откуда | Куда | Длина   ← заголовки
-    Строка 7: 1 | ...   | ...    | ...  | 15.5    ← данные
-    ```
-    
-    → Диапазон: **`A6:E6`**
-    → Данные будут записаны со строки **7**
-    
-    ### 🧩 Многострочные заголовки
-    
-    ```
-    Строка 5: [объединённая ячейка]  Трасса
-    Строка 6:                        Начало | Конец
-    Строка 7:                        1      | 2     ← данные
-    ```
-    
-    → Диапазон: **`B5:C6`**
-    → Получите столбцы: `Трасса / Начало`, `Трасса / Конец`
-    """)
+    st.info("👈 Загрузите шаблон и укажите диапазон заголовков (напр. `B5:J6`).")
