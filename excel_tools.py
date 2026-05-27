@@ -9,7 +9,6 @@ from openpyxl.cell.cell import MergedCell
 # ==================== Парсинг диапазонов ====================
 
 def parse_range(range_str):
-    """Парсит диапазон вида 'B5:J6' или 'B5'."""
     s = range_str.strip().upper().replace(" ", "")
     if not s:
         raise ValueError("Диапазон пустой")
@@ -28,7 +27,6 @@ def parse_range(range_str):
 # ==================== Работа с merged cells ====================
 
 def get_merged_value(ws, row, col):
-    """Возвращает значение ячейки, учитывая объединения."""
     cell = ws.cell(row=row, column=col)
     if isinstance(cell, MergedCell):
         for rng in ws.merged_cells.ranges:
@@ -38,7 +36,6 @@ def get_merged_value(ws, row, col):
 
 
 def get_merged_ranges_in_range(ws, r1, c1, r2, c2):
-    """Находит все merged-диапазоны, пересекающиеся с указанным."""
     result = []
     for rng in ws.merged_cells.ranges:
         if (rng.min_row <= r2 and rng.max_row >= r1 and
@@ -56,35 +53,91 @@ def get_merged_ranges_in_range(ws, r1, c1, r2, c2):
     return result
 
 
-# ==================== HTML-превью заголовка ====================
+# ==================== HTML-превью заголовка (СИНХРОНИЗИРОВАННЫЙ) ====================
 
-def build_header_html(r1, c1, r2, c2, merged_ranges):
-    """Строит HTML-таблицу с визуализацией объединений."""
-    nrows, ncols = r2 - r1 + 1, c2 - c1 + 1
+# Палитра цветов для разных объединённых групп
+GROUP_COLORS = [
+    "#dbeafe",  # голубой
+    "#fef3c7",  # жёлтый
+    "#dcfce7",  # зелёный
+    "#fce7f3",  # розовый
+    "#e0e7ff",  # индиго
+    "#fed7aa",  # оранжевый
+    "#ddd6fe",  # фиолетовый
+    "#ccfbf1",  # бирюзовый
+]
+
+
+def build_header_html(r1, c1, r2, c2, merged_ranges, col_widths_px):
+    """
+    Строит HTML-заголовок, синхронизированный по ширине с data_editor.
+
+    col_widths_px: список ширин в пикселях для каждой колонки (c1..c2).
+    """
+    nrows = r2 - r1 + 1
+    ncols = c2 - c1 + 1
     covered = [[False] * ncols for _ in range(nrows)]
 
-    html = '<table style="border-collapse: collapse; margin: 10px 0; font-family: monospace;">'
+    # Присваиваем цвета группам объединений
+    color_map = {}
+    color_idx = 0
+    for mr in merged_ranges:
+        if mr["colspan"] > 1 or mr["rowspan"] > 1:
+            key = (mr["r1"], mr["c1"])
+            if key not in color_map:
+                color_map[key] = GROUP_COLORS[color_idx % len(GROUP_COLORS)]
+                color_idx += 1
+
+    html = (
+        '<table style="border-collapse: collapse; margin: 0 0 4px 0; '
+        'font-family: system-ui, sans-serif; font-size: 13px; '
+        'table-layout: fixed; width: max-content;">'
+    )
+
+    # Определяем ширины колонок через <col>
+    html += "<colgroup>"
+    for w in col_widths_px:
+        html += f'<col style="width: {w}px;">'
+    html += "</colgroup>"
+
     for ri in range(nrows):
         html += "<tr>"
         for ci in range(ncols):
             if covered[ri][ci]:
                 continue
             abs_r, abs_c = r1 + ri, c1 + ci
-            found = next((mr for mr in merged_ranges if mr["r1"] == abs_r and mr["c1"] == abs_c), None)
+            found = next(
+                (mr for mr in merged_ranges if mr["r1"] == abs_r and mr["c1"] == abs_c),
+                None,
+            )
 
             if found:
+                # Отмечаем покрытые ячейки
                 for dr in range(found["rowspan"]):
                     for dc in range(found["colspan"]):
                         if ri + dr < nrows and ci + dc < ncols:
                             covered[ri + dr][ci + dc] = True
+
                 val = str(found["value"]) if found["value"] not in (None, "") else ""
-                html += (f'<td rowspan="{found["rowspan"]}" colspan="{found["colspan"]}" '
-                         f'style="border: 1px solid #888; padding: 6px 10px; '
-                         f'background: #e7f3ff; font-weight: bold; text-align: center; '
-                         f'vertical-align: middle; min-width: 60px;">{val}</td>')
+                bg = color_map.get((found["r1"], found["c1"]), "#e7f3ff")
+                is_merged = found["colspan"] > 1 or found["rowspan"] > 1
+                border_left = "3px solid #1e40af" if is_merged and ci == 0 else "1px solid #888"
+
+                html += (
+                    f'<td rowspan="{found["rowspan"]}" colspan="{found["colspan"]}" '
+                    f'style="border: 1px solid #888; border-left: {border_left}; '
+                    f'padding: 8px 6px; background: {bg}; font-weight: 600; '
+                    f'text-align: center; vertical-align: middle; '
+                    f'color: #1f2937; white-space: normal; word-break: break-word;">{val}</td>'
+                )
             else:
-                html += (f'<td style="border: 1px solid #888; padding: 6px 10px; '
-                         f'text-align: center; min-width: 60px;"></td>')
+                # Обычная ячейка
+                val_raw = ""
+                html += (
+                    f'<td style="border: 1px solid #888; padding: 8px 6px; '
+                    f'text-align: center; vertical-align: middle; '
+                    f'background: #f9fafb; color: #6b7280; font-weight: 500;">{val_raw}</td>'
+                )
         html += "</tr>"
     html += "</table>"
     return html
@@ -93,7 +146,6 @@ def build_header_html(r1, c1, r2, c2, merged_ranges):
 # ==================== Парсинг шаблона ====================
 
 def parse_template(file_bytes, sheet_name, header_range_str):
-    """Разбирает Excel-шаблон и возвращает конфигурацию."""
     wb = load_workbook(io.BytesIO(file_bytes))
     ws = wb[sheet_name]
     r1, c1, r2, c2 = parse_range(header_range_str)
@@ -144,23 +196,21 @@ def parse_template(file_bytes, sheet_name, header_range_str):
     return {
         "ws_name": ws.title,
         "header_range": f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}",
+        "header_coords": (r1, c1, r2, c2),
         "data_start_row": data_start_row,
         "columns": columns,
         "types": types,
         "merged_ranges": merged_ranges,
-        "header_html": build_header_html(r1, c1, r2, c2, merged_ranges),
     }
 
 
 # ==================== Экспорт в Excel ====================
 
 def export_to_excel(template_bytes, ws_name, data_start_row, columns_map, df):
-    """Записывает DataFrame в Excel-шаблон, сохраняя формулы и стили."""
     output = io.BytesIO()
     wb = load_workbook(io.BytesIO(template_bytes))
     ws = wb[ws_name]
 
-    # Очистка старых данных
     for r in range(data_start_row, data_start_row + 2000):
         all_empty = True
         for c in columns_map.values():
@@ -175,7 +225,6 @@ def export_to_excel(template_bytes, ws_name, data_start_row, columns_map, df):
             if not (isinstance(cell.value, str) and cell.value.startswith("=")):
                 cell.value = None
 
-    # Запись новых данных
     for i, (_, row) in enumerate(df.iterrows()):
         for col_name, val in row.items():
             if col_name in columns_map:
@@ -191,7 +240,6 @@ def export_to_excel(template_bytes, ws_name, data_start_row, columns_map, df):
 
 
 def _is_empty(val):
-    """Проверяет, пустое ли значение."""
     if val is None or val == "":
         return True
     try:
@@ -202,7 +250,6 @@ def _is_empty(val):
 
 
 def _to_python(val):
-    """Конвертирует numpy-типы в Python для openpyxl."""
     import numpy as np
     if isinstance(val, (np.integer,)):
         return int(val)
