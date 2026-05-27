@@ -3,125 +3,234 @@ import pandas as pd
 import io
 import json
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import MergedCell
 
-st.set_page_config(page_title="КЖ — СКС", page_icon="🔌", layout="wide")
-st.title("🔌 Калькулятор кабельного журнала (СКС)")
+st.set_page_config(page_title="Универсальный КЖ", page_icon="📋", layout="wide")
+st.title("📋 Универсальный калькулятор кабельного журнала")
 
-# --- Инициализация ---
+# --- Инициализация состояния ---
 if "df" not in st.session_state:
-    # Колонки соответствуют входным данным шаблона (без формул)
-    st.session_state.df = pd.DataFrame(columns=[
-        "Обозначение", "Шкаф", "Панель", "Порт", "Помещение", "Этаж",
-        "Розетка", "Открыто_м", "Гофра_м", "ТЖГ_м", "Подъём_розетка",
-        "Вертикаль_кросс", "Марка", "Жилы", "Длина_линии"
-    ])
+    st.session_state.df = None
 if "template" not in st.session_state:
     st.session_state.template = None
+if "config" not in st.session_state:
+    st.session_state.config = {}  # sheet, header_row, columns_map
 
-# --- Загрузка шаблона ---
-with st.expander("⚙️ Шаблон и проект", expanded=True):
-    col1, col2, col3 = st.columns(3)
-    
-    tpl = col1.file_uploader("📄 Загрузить КЖ.xlsm", type=["xlsm"])
-    if tpl:
-        st.session_state.template = tpl.read()
-        st.success("✅ Шаблон загружен")
-    
-    if not st.session_state.df.empty:
-        json_str = st.session_state.df.to_json(orient="records", force_ascii=False)
-        col2.download_button("💾 Проект (.json)", json_str.encode("utf-8"), 
-                           "project.json", "application/json", use_container_width=True)
 
-# --- Экспорт в XLSM с сохранением формул ---
-def export_to_xlsm(df, template_bytes):
-    output = io.BytesIO()
-    wb = load_workbook(filename=io.BytesIO(template_bytes), keep_vba=True)
-    ws = wb["Кабельный"]  # работаем только с листом данных
+# --- Функция: автопоиск строки заголовков ---
+def find_header_row(ws, max_search=20):
+    """Ищет первую строку, где подряд заполнено ≥3 ячеек (вероятно, заголовки)."""
+    for row in range(1, max_search + 1):
+        filled = 0
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            if cell.value and not isinstance(cell, MergedCell):
+                filled += 1
+            else:
+                filled = 0
+            if filled >= 3:
+                return row
+    return 1
+
+
+# --- Функция: извлечение заголовков и структуры ---
+def parse_template(file_bytes, sheet_name=None, header_row=None):
+    wb = load_workbook(io.BytesIO(file_bytes))
+    ws = wb[sheet_name] if sheet_name else wb.active
     
-    # Данные начинаем писать с 8-й строки (после шапки)
-    START_ROW = 8
+    if header_row is None:
+        header_row = find_header_row(ws)
     
-    # Маппинг: колонка DataFrame → колонка Excel (1-based)
-    COL_MAP = {
-        "Обозначение": 2,    # B
-        "Шкаф": 3,           # C
-        "Панель": 4,         # D
-        "Порт": 5,           # E
-        "Помещение": 20,     # T → формула F=T сработает автоматически
-        "Этаж": 7,           # G
-        "Розетка": 8,        # H
-        "Открыто_м": 9,      # I
-        # J, K, N — формулы, не трогаем
-        "Гофра_м": 22,       # V
-        "ТЖГ_м": 23,         # W
-        "Подъём_розетка": 24,# X
-        "Вертикаль_кросс": 26,# Z
-        "Марка": 12,         # L
-        "Жилы": 13,          # M
-        "Длина_линии": 21,   # U — база для формул J,K
+    # Читаем заголовки
+    columns = {}
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=header_row, column=col)
+        if cell.value and not isinstance(cell, MergedCell):
+            columns[str(cell.value).strip()] = col
+    
+    # Определяем типы по первой строке данных
+    types = {}
+    for col_name, col_idx in columns.items():
+        sample = ws.cell(row=header_row + 1, column=col_idx).value
+        if isinstance(sample, (int, float)):
+            types[col_name] = "number"
+        else:
+            types[col_name] = "text"
+    
+    return {
+        "wb": wb,
+        "ws_name": ws.title,
+        "header_row": header_row,
+        "columns": columns,
+        "types": types,
     }
+
+
+# --- Боковая панель: загрузка и настройки ---
+with st.sidebar:
+    st.header("⚙️ Настройки")
     
-    for i, (_, row) in enumerate(df.iterrows()):
-        excel_row = START_ROW + i
-        for col_name, excel_col in COL_MAP.items():
-            if col_name in row and pd.notna(row[col_name]):
-                val = row[col_name]
-                # Конвертация типов для openpyxl
-                if isinstance(val, (pd.Int64Dtype, pd.Float64Dtype)):
-                    val = float(val) if pd.notna(val) else None
-                ws.cell(row=excel_row, column=excel_col, value=val)
+    uploaded = st.file_uploader("📄 Загрузить шаблон .xlsx", type=["xlsx"])
     
-    wb.save(output)
-    return output.getvalue()
+    if uploaded is not None:
+        st.session_state.template = uploaded.getvalue()
+        
+        # Получаем список листов
+        wb_tmp = load_workbook(io.BytesIO(uploaded.getvalue()), read_only=True)
+        sheet_names = wb_tmp.sheetnames
+        wb_tmp.close()
+        
+        selected_sheet = st.selectbox("Лист", sheet_names)
+        header_row = st.number_input(
+            "Строка заголовков",
+            min_value=1, max_value=50, value=1,
+            help="Номер строки, где находятся заголовки столбцов"
+        )
+        
+        if st.button("🔄 Применить и распознать"):
+            try:
+                cfg = parse_template(
+                    st.session_state.template,
+                    sheet_name=selected_sheet,
+                    header_row=int(header_row),
+                )
+                st.session_state.config = cfg
+                # Создаём пустой DataFrame с нужными колонками
+                st.session_state.df = pd.DataFrame(columns=list(cfg["columns"].keys()))
+                st.success(f"✅ Найдено {len(cfg['columns'])} столбцов")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Ошибка разбора: {e}")
+    
+    st.divider()
+    st.caption("💡 Шаблон может содержать формулы, рамки, стили — всё сохранится")
 
-# --- Кнопка экспорта ---
-if not st.session_state.df.empty and st.session_state.template:
-    if st.button("📥 Выгрузить в КЖ.xlsm", type="primary"):
-        try:
-            xlsm_data = export_to_xlsm(st.session_state.df, st.session_state.template)
-            st.download_button(
-                label="⬇️ Скачать готовый файл",
-                data=xlsm_data,
-                file_name="КЖ_заполненный.xlsm",
-                mime="application/vnd.ms-excel.sheet.macroEnabled.12",
-                use_container_width=True
-            )
-            st.success("✅ Файл сформирован! Формулы и макросы сохранены.")
-        except Exception as e:
-            st.error(f"Ошибка экспорта: {e}")
 
-# --- Редактор данных ---
-st.subheader("📝 Ввод данных по линиям")
-df = st.data_editor(
-    st.session_state.df,
-    column_config={
-        "Обозначение": st.column_config.TextColumn("№ линии", width="small"),
-        "Шкаф": st.column_config.TextColumn("Шкаф", width="small"),
-        "Панель": st.column_config.TextColumn("Панель", width="tiny"),
-        "Порт": st.column_config.TextColumn("Порт", width="tiny"),
-        "Помещение": st.column_config.TextColumn("Пом. №", width="tiny"),
-        "Этаж": st.column_config.NumberColumn("Этаж", min_value=0, width="tiny"),
-        "Розетка": st.column_config.TextColumn("Розетка", width="medium"),
-        "Открыто_м": st.column_config.NumberColumn("Открыто, м", min_value=0, step=0.5),
-        "Гофра_м": st.column_config.NumberColumn("Гофра, м", min_value=0, step=0.5),
-        "ТЖГ_м": st.column_config.NumberColumn("ТЖГ, м", min_value=0, step=0.5),
-        "Подъём_розетка": st.column_config.NumberColumn("↑ к розетке, м", min_value=0, step=0.1),
-        "Вертикаль_кросс": st.column_config.NumberColumn("↑ в кросс, м", min_value=0, step=0.1),
-        "Марка": st.column_config.TextColumn("Марка", width="medium"),
-        "Жилы": st.column_config.TextColumn("Жилы", width="tiny"),
-        "Длина_линии": st.column_config.NumberColumn("База, м", min_value=0, step=0.5,
-            help="Базовая длина для формул запаса")
-    },
-    hide_index=True,
-    use_container_width=True,
-    num_rows="dynamic"
-)
-st.session_state.df = df
+# --- Основная область ---
+if st.session_state.config:
+    cfg = st.session_state.config
+    
+    # --- Информация о шаблоне ---
+    with st.expander("📐 Структура шаблона", expanded=False):
+        st.write(f"**Лист:** `{cfg['ws_name']}`")
+        st.write(f"**Строка заголовков:** {cfg['header_row']}")
+        st.write(f"**Найдено столбцов:** {len(cfg['columns'])}")
+        
+        cols_preview = pd.DataFrame([
+            {"Столбец": name, "Колонка Excel": get_column_letter(idx), "Тип": cfg["types"][name]}
+            for name, idx in cfg["columns"].items()
+        ])
+        st.dataframe(cols_preview, use_container_width=True, hide_index=True)
+    
+    # --- Редактор таблицы ---
+    st.subheader("📝 Заполнение данных")
+    
+    # Динамическая конфигурация столбцов
+    column_config = {}
+    for col_name in cfg["columns"].keys():
+        if cfg["types"].get(col_name) == "number":
+            column_config[col_name] = st.column_config.NumberColumn(col_name, step=0.5)
+        else:
+            column_config[col_name] = st.column_config.TextColumn(col_name)
+    
+    df = st.data_editor(
+        st.session_state.df if st.session_state.df is not None else pd.DataFrame(columns=list(cfg["columns"].keys())),
+        column_config=column_config,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="dynamic",
+    )
+    st.session_state.df = df
+    
+    # --- Сводка ---
+    if df is not None and not df.empty:
+        st.subheader("📊 Сводка")
+        c1, c2 = st.columns(2)
+        c1.metric("Строк заполнено", len(df))
+        # Ищем числовые столбцы для суммы
+        numeric_cols = [c for c in df.columns if df[c].dtype in ['float64', 'int64']]
+        if numeric_cols:
+            total = df[numeric_cols].sum().sum()
+            c2.metric("Сумма по числам", f"{total:.2f}")
+    
+    # --- Экспорт ---
+    st.divider()
+    if st.session_state.df is not None and not st.session_state.df.empty:
+        if st.button("📥 Сформировать Excel по шаблону", type="primary"):
+            try:
+                output = io.BytesIO()
+                wb = load_workbook(io.BytesIO(st.session_state.template))
+                ws = wb[cfg["ws_name"]]
+                
+                start_row = cfg["header_row"] + 1
+                col_map = cfg["columns"]
+                
+                # Очистка старых данных (только значения, не формулы в шаблоне)
+                # и запись новых
+                for i, (_, row) in enumerate(st.session_state.df.iterrows()):
+                    excel_row = start_row + i
+                    for col_name, value in row.items():
+                        if col_name not in col_map:
+                            continue
+                        excel_col = col_map[col_name]
+                        cell = ws.cell(row=excel_row, column=excel_col)
+                        
+                        # НЕ перезаписываем ячейки с формулами в шаблоне
+                        if isinstance(cell.value, str) and cell.value.startswith("="):
+                            continue
+                        
+                        # Конвертация NaN/None
+                        if pd.isna(value):
+                            cell.value = None
+                        else:
+                            cell.value = value
+                
+                wb.save(output)
+                
+                st.download_button(
+                    label="⬇️ Скачать заполненный файл",
+                    data=output.getvalue(),
+                    file_name="кабельный_журнал_заполненный.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+                st.success("✅ Файл готов. Форматирование и формулы шаблона сохранены.")
+            except Exception as e:
+                st.error(f"Ошибка экспорта: {e}")
+                st.exception(e)
+    
+    # --- Сохранение проекта в JSON ---
+    if st.session_state.df is not None and not st.session_state.df.empty:
+        json_str = st.session_state.df.to_json(orient="records", force_ascii=False)
+        st.download_button(
+            "💾 Сохранить проект (.json)",
+            data=json_str.encode("utf-8"),
+            file_name="project.json",
+            mime="application/json",
+        )
 
-# --- Сводка ---
-if not df.empty:
-    st.subheader("📊 Сводка")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Линий", len(df))
-    c2.metric("Кабель (итого)", f"{df['Длина_линии'].sum():.1f} м")
-    c3.metric("Средний запас", "15% (в формулах)")
+else:
+    st.info("👈 Загрузите шаблон `.xlsx` в боковой панели и нажмите **«Применить и распознать»**")
+    
+    st.markdown("""
+    ### 📋 Как подготовить шаблон
+    
+    1. Откройте Excel и создайте файл с заголовками в любой строке (например, в строке 6)
+    2. Выше можно разместить логотип, штампы, информацию о проекте
+    3. Заголовки должны идти подряд (3+ заполненных ячеек в строке)
+    4. Формулы, цвета, границы, ширины колонок — всё сохранится
+    5. Сохраните как `.xlsx`
+    
+    ### ✅ Пример минимального шаблона
+    
+    | A | B | C | D | E |
+    |---|---|---|---|---|
+    | (логотип) | | | | |
+    | Проект: Объект №1 | | | | |
+    | | | | | |
+    | | | | | |
+    | | | | | |
+    | № | Марка | Откуда | Куда | Длина, м |  ← строка 6
+    | 1 | ВВГнг 3×2.5 | ЩР1 | Роз.1 | 15.5 | ← данные начнутся отсюда
+    """)
