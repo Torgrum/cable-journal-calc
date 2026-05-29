@@ -1,54 +1,76 @@
-"""Универсальный калькулятор кабельного журнала на основе Excel-шаблона."""
+"""Универсальный калькулятор кабельного журнала с объединёнными заголовками и авто-шириной."""
 import streamlit as st
 import pandas as pd
 import io
 import json
 from openpyxl.utils import get_column_letter
 from openpyxl import load_workbook
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, DataReturnMode, GridUpdateMode
 
-from excel_tools import parse_template, export_to_excel, build_header_html
+from excel_tools import parse_template, export_to_excel
 
 st.set_page_config(page_title="Универсальный КЖ", page_icon="📋", layout="wide")
 st.title("📋 Универсальный калькулятор кабельного журнала")
 
-
 # ==================== Session state ====================
-
 if "template_bytes" not in st.session_state:
     st.session_state.template_bytes = None
 if "config" not in st.session_state:
     st.session_state.config = None
 if "df_initial" not in st.session_state:
     st.session_state.df_initial = None
-if "col_width_mode" not in st.session_state:
-    st.session_state.col_width_mode = "Средний"
-
-
-# ==================== Вспомогательные функции ====================
-
-WIDTH_MAP = {"Компактный": 80, "Средний": 150, "Широкий": 250}
-
-
-def get_width_for_mode(mode, col_name, col_type):
-    if mode in WIDTH_MAP:
-        return WIDTH_MAP[mode]
-    # Авто
-    estimated = max(80, min(400, len(str(col_name)) * 8 + 30))
-    if col_type == "number":
-        estimated = max(80, estimated - 30)
-    return estimated
-
 
 def reset_editor():
-    if "data_editor" in st.session_state:
-        del st.session_state["data_editor"]
+    if "ag_grid_main" in st.session_state:
+        del st.session_state["ag_grid_main"]
 
+def build_column_groups(columns_map, types_map, merged_ranges, header_coords):
+    """Строит структуру columnDefs для Ag-Grid с объединениями."""
+    r1, c1, r2, c2 = header_coords
+    ordered = sorted(columns_map.items(), key=lambda x: x[1])
+    groups = []
+    processed_cols = set()
+    
+    for col_name, excel_col in ordered:
+        if excel_col in processed_cols:
+            continue
+            
+        top_merge = None
+        for mr in merged_ranges:
+            if mr["r1"] == r1 and mr["c1"] <= excel_col <= mr["c2"]:
+                top_merge = mr
+                break
+                
+        if top_merge and top_merge["colspan"] > 1:
+            group_children = []
+            group_name = str(top_merge["value"]) if top_merge["value"] else ""
+            for child_col in range(top_merge["c1"], top_merge["c2"] + 1):
+                child_name = next((n for n, idx in columns_map.items() if idx == child_col), None)
+                if child_name:
+                    group_children.append({
+                        "headerName": child_name,
+                        "field": child_name,
+                        "editable": True,
+                        "type": "numericColumn" if types_map[child_name] == "number" else None,
+                        "resizable": True, "sortable": True, "filter": True,
+                    })
+                    processed_cols.add(child_col)
+            if group_children:
+                groups.append({"headerName": group_name, "children": group_children})
+        else:
+            groups.append({
+                "headerName": col_name,
+                "field": col_name,
+                "editable": True,
+                "type": "numericColumn" if types_map[col_name] == "number" else None,
+                "resizable": True, "sortable": True, "filter": True,
+            })
+            processed_cols.add(excel_col)
+    return groups
 
 # ==================== Сайдбар ====================
-
 with st.sidebar:
     st.header("⚙️ Настройки")
-
     uploaded = st.file_uploader("📄 Загрузить шаблон .xlsx", type=["xlsx"])
     if uploaded is not None:
         new_bytes = uploaded.getvalue()
@@ -59,10 +81,8 @@ with st.sidebar:
 
     if st.session_state.template_bytes is not None:
         wb_tmp = load_workbook(io.BytesIO(st.session_state.template_bytes), read_only=True)
-        sheet_names = wb_tmp.sheetnames
+        selected_sheet = st.selectbox("Лист", wb_tmp.sheetnames)
         wb_tmp.close()
-
-        selected_sheet = st.selectbox("Лист", sheet_names)
 
         st.markdown("**Диапазон заголовка** (напр. `B5:J6`)")
         header_range = st.text_input("Диапазон", value="A1:E1", placeholder="B5:J6")
@@ -78,24 +98,9 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Ошибка: {e}")
 
-    st.divider()
-    st.header("📏 Отображение")
-    st.session_state.col_width_mode = st.radio(
-        "Размер столбцов",
-        options=["Компактный", "Средний", "Широкий", "Авто"],
-        index=["Компактный", "Средний", "Широкий", "Авто"].index(st.session_state.col_width_mode),
-    )
-    st.info("💡 Ширину столбцов можно менять мышкой.")
-
-    st.divider()
-    st.markdown("**🎨 Легенда объединений**")
-    st.caption("Цветные блоки над таблицей — объединённые ячейки из шаблона.")
-
-
 # ==================== Основная область ====================
-
 if st.session_state.config is None:
-    st.info("👈 Загрузите шаблон `.xlsx` и укажите диапазон заголовков.")
+    st.info("👈 Загрузите шаблон `.xlsx` слева и укажите диапазон заголовков.")
     st.stop()
 
 cfg = st.session_state.config
@@ -103,91 +108,78 @@ cols = list(cfg["columns"].keys())
 
 if st.session_state.df_initial is None or list(st.session_state.df_initial.columns) != cols:
     st.session_state.df_initial = pd.DataFrame(columns=cols)
-    reset_editor()
 
-# --- Превью структуры (свёрнутое) ---
-with st.expander("📐 Подробности структуры", expanded=False):
-    c1, c2, c3 = st.columns(3)
-    c1.write(f"**Лист:** `{cfg['ws_name']}`")
-    c2.write(f"**Диапазон:** `{cfg['header_range']}`")
-    c3.write(f"**Старт данных:** строка {cfg['data_start_row']}")
-
-    if cfg["merged_ranges"]:
-        st.info(f"🔗 Объединённых диапазонов: **{len(cfg['merged_ranges'])}**")
-
-    st.dataframe(pd.DataFrame([
-        {"Имя": n, "Excel": get_column_letter(i),
-         "Тип": "🔢" if cfg["types"][n] == "number" else "🔤"}
-        for n, i in cfg["columns"].items()
-    ]), hide_index=True, use_container_width=True)
-
-# ============================================================
-# 🔑 ГЛАВНОЕ: синхронизированный HTML-заголовок + редактор
-# ============================================================
+with st.expander("📐 Структура шаблона", expanded=False):
+    st.write(f"**Лист:** `{cfg['ws_name']}` | **Диапазон:** `{cfg['header_range']}` | **Старт данных:** строка {cfg['data_start_row']}")
 
 st.subheader("📝 Заполнение данных")
-st.caption(
-    "🎨 Цветные блоки сверху повторяют объединения из шаблона. "
-    "Ширины синхронизированы с таблицей ниже."
-)
 
-# 1. Вычисляем ширины колонок в том же порядке, что и в шаблоне
-r1, c1_idx, r2, c2_idx = cfg["header_coords"]
-ordered_cols = sorted(cfg["columns"].items(), key=lambda x: x[1])  # сортируем по № колонки в Excel
+# --- Кнопки управления ---
+col_add, col_clear, _ = st.columns([1, 1, 4])
+with col_add:
+    if st.button("➕ Добавить строку"):
+        new_row = pd.DataFrame([{c: None for c in cols}])
+        st.session_state.df_initial = pd.concat([st.session_state.df_initial, new_row], ignore_index=True)
+        reset_editor()
+        st.rerun()
+with col_clear:
+    if st.button("🗑️ Очистить всё"):
+        st.session_state.df_initial = pd.DataFrame(columns=cols)
+        reset_editor()
+        st.rerun()
 
-# Для пустых колонок (которые не попали в columns) ставим базовую ширину
-base_width = WIDTH_MAP.get(st.session_state.col_width_mode, 150)
-col_widths_px = []
-for c in range(c1_idx, c2_idx + 1):
-    # Ищем колонку с таким индексом
-    matched = next((n for n, idx in cfg["columns"].items() if idx == c), None)
-    if matched:
-        col_widths_px.append(get_width_for_mode(st.session_state.col_width_mode, matched, cfg["types"][matched]))
-    else:
-        col_widths_px.append(base_width)
+# ============================================================
+# 🔑 AG-GRID С ОБЪЕДИНЕНИЯМИ И АВТО-ШИРИНОЙ
+# ============================================================
+column_groups = build_column_groups(cfg["columns"], cfg["types"], cfg["merged_ranges"], cfg["header_coords"])
 
-# 2. Рендерим HTML-заголовок
-header_html = build_header_html(r1, c1_idx, r2, c2_idx, cfg["merged_ranges"], col_widths_px)
+gb = GridOptionsBuilder.from_dataframe(st.session_state.df_initial)
+gb.configure_default_column(editable=True, resizable=True, sortable=True, filter=True, wrapText=True, autoHeight=True)
 
-# Обёртка с горизонтальной прокруткой, синхронизированной с таблицей
-st.markdown(
-    f'''
-    <div style="overflow-x: auto; padding-bottom: 8px; border-bottom: 2px solid #e5e7eb; margin-bottom: 4px;">
-        {header_html}
-    </div>
-    ''',
-    unsafe_allow_html=True,
-)
+grid_options = gb.build()
+grid_options["columnDefs"] = column_groups
+grid_options["rowSelection"] = "multiple"
+grid_options["animateRows"] = True
+grid_options["stopEditingWhenCellsLoseFocus"] = True
+grid_options["singleClickEdit"] = True
 
-# 3. Редактор с теми же ширинами
-col_cfg = {}
-for n in cols:
-    w = get_width_for_mode(st.session_state.col_width_mode, n, cfg["types"][n])
-    if cfg["types"][n] == "number":
-        col_cfg[n] = st.column_config.NumberColumn(n, step=0.5, width=w)
-    else:
-        col_cfg[n] = st.column_config.TextColumn(n, width=w)
+# 🔑 БЛОК АВТО-ШИРИНЫ (растягивает таблицу под экран)
+grid_options["autoSizeStrategy"] = {
+    "type": "fitGridWidth",
+    "skipHeader": False,
+    "defaultMinWidth": 100,
+    "defaultMaxWidth": 400,
+}
+grid_options["domLayout"] = "autoHeight"
 
-edited_df = st.data_editor(
+# Рендер таблицы
+grid_response = AgGrid(
     st.session_state.df_initial,
-    column_config=col_cfg,
-    column_order=cols,
-    hide_index=True,
-    use_container_width=False,  # важно! иначе ширины не синхронизируются
-    num_rows="dynamic",
-    key="data_editor",
+    gridOptions=grid_options,
+    height=500,
+    width="100%",
+    data_return_mode=DataReturnMode.AS_INPUT,
+    update_mode=GridUpdateMode.VALUE_CHANGED,
+    fit_columns_on_grid_load=True,
+    allow_unsafe_jscode=True,
+    theme="streamlit",
+    key="ag_grid_main",
 )
 
-# --- Постобработка ---
+# Получаем данные из таблицы
+edited_df = pd.DataFrame(grid_response["data"]) if grid_response["data"] is not None else st.session_state.df_initial
+st.session_state.df_initial = edited_df
+
 df_clean = edited_df.copy().replace('', pd.NA).dropna(how='all').reset_index(drop=True)
 
+# ==================== Сводка и Экспорт ====================
 if not df_clean.empty:
     st.subheader("📊 Сводка")
     c1, c2 = st.columns(2)
-    c1.metric("Строк", len(df_clean))
+    c1.metric("Строк заполнено", len(df_clean))
     num_cols = df_clean.select_dtypes(include=['number']).columns
     if len(num_cols) > 0:
-        c2.metric("Сумма", f"{df_clean[num_cols].sum().sum():.2f}")
+        c2.metric("Сумма по числам", f"{df_clean[num_cols].sum().sum():.2f}")
 
     st.divider()
 
@@ -200,39 +192,32 @@ if not df_clean.empty:
                 columns_map=cfg["columns"],
                 df=df_clean,
             )
-            st.download_button(
-                "⬇️ Скачать файл",
-                result_bytes,
-                "journal_filled.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            st.success(f"✅ Записано {len(df_clean)} строк. Объединения и стили сохранены.")
+            st.download_button("⬇️ Скачать файл", result_bytes, "journal_filled.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
+            st.success("✅ Файл готов! Объединения и стили шаблона сохранены.")
         except Exception as e:
-            st.error(f"Ошибка: {e}")
-            st.exception(e)
+            st.error(f"Ошибка экспорта: {e}")
 
+    # JSON Сохранение/Загрузка
     try:
         json_str = df_clean.to_json(orient="records", force_ascii=False, default_handler=str)
-        st.download_button("💾 Сохранить проект (.json)", json_str.encode("utf-8"),
-                           "project.json", "application/json")
+        st.download_button("💾 Сохранить проект (.json)", json_str.encode("utf-8"), "project.json", "application/json")
     except Exception:
         pass
 
-    uploaded_project = st.file_uploader("📂 Загрузить проект", type=["json"], key="proj_loader")
+    uploaded_project = st.file_uploader("📂 Загрузить сохранённый проект", type=["json"], key="proj_loader")
     if uploaded_project is not None:
         try:
             data = json.loads(uploaded_project.read().decode("utf-8"))
             loaded_df = pd.DataFrame(data)
             for c in cols:
-                if c not in loaded_df.columns:
-                    loaded_df[c] = None
-            loaded_df = loaded_df[cols]
-            st.session_state.df_initial = loaded_df
+                if c not in loaded_df.columns: loaded_df[c] = None
+            st.session_state.df_initial = loaded_df[cols]
             reset_editor()
             st.success(f"✅ Загружено {len(loaded_df)} строк")
             st.rerun()
         except Exception as e:
             st.error(f"Ошибка: {e}")
 else:
-    st.info("Добавьте строки в таблицу (кнопка + внизу таблицы).")
+    st.info("Таблица пуста. Нажмите **➕ Добавить строку** выше, чтобы начать.")
